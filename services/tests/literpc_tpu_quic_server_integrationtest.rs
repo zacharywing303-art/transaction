@@ -1,7 +1,7 @@
 use countmap::CountMap;
 use crossbeam_channel::Sender;
 
-use log::{debug, info, trace, warn};
+use log::{debug, error, info, trace, warn};
 
 use solana_lite_rpc_core::quic_connection_utils::QuicConnectionParameters;
 use solana_lite_rpc_core::structures::identity_stakes::IdentityStakes;
@@ -31,6 +31,8 @@ use std::time::{Duration, Instant};
 use tokio::runtime::Builder;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
+use tracing_subscriber::fmt::format::FmtSpan;
+use tracing_subscriber::EnvFilter;
 
 #[derive(Copy, Clone, Debug)]
 struct TestCaseParams {
@@ -71,7 +73,7 @@ pub fn small_tx_batch_unstaked() {
     });
 }
 
-// fails on ci
+// note: this tests are flakes on CI ond also local (see https://mangolana.atlassian.net/browse/MAN-59)
 #[ignore]
 #[test]
 pub fn many_transactions() {
@@ -83,6 +85,7 @@ pub fn many_transactions() {
     });
 }
 
+// note: this tests are flakes on CI ond also local (see https://mangolana.atlassian.net/browse/MAN-59)
 #[ignore]
 #[test]
 pub fn too_many_transactions() {
@@ -96,6 +99,7 @@ pub fn too_many_transactions() {
 
 // note: this not a tokio test as runtimes get created as part of the integration test
 fn wireup_and_send_txs_via_channel(test_case_params: TestCaseParams) {
+    configure_panic_hook();
     // value from solana - see quic streamer - see quic.rs -> rt()
     const NUM_QUIC_STREAMER_WORKER_THREADS: usize = 1;
     let runtime_quic1 = Builder::new_multi_thread()
@@ -162,8 +166,8 @@ fn wireup_and_send_txs_via_channel(test_case_params: TestCaseParams) {
         let mut count_map: CountMap<Signature> =
             CountMap::with_capacity(test_case_params.sample_tx_count as usize);
         let warmup_tx_count: u32 = test_case_params.sample_tx_count / 2;
-        while packet_count < test_case_params.sample_tx_count {
-            if latest_tx.elapsed() > Duration::from_secs(5) {
+        while (count_map.len() as u32) < test_case_params.sample_tx_count {
+            if latest_tx.elapsed() > Duration::from_secs(50) {
                 warn!("abort after timeout waiting for packet from quic streamer");
                 break;
             }
@@ -233,7 +237,6 @@ fn wireup_and_send_txs_via_channel(test_case_params: TestCaseParams) {
             test_case_params.sample_tx_count,
             "count_map size should be equal to sample_tx_count"
         );
-        // note: this assumption will not hold as soon as test is configured to do fanout
         assert!(
             count_map.values().all(|cnt| *cnt == 1),
             "all transactions should be unique"
@@ -245,14 +248,41 @@ fn wireup_and_send_txs_via_channel(test_case_params: TestCaseParams) {
     packet_consumer_jh.join().unwrap();
 }
 
+fn configure_panic_hook() {
+    let default_panic = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        default_panic(panic_info);
+        if let Some(location) = panic_info.location() {
+            error!(
+                "panic occurred in file '{}' at line {}",
+                location.file(),
+                location.line(),
+            );
+        } else {
+            error!("panic occurred but can't get location information...");
+        }
+        // note: we do not exit the process to allow proper test execution
+    }));
+}
+
 fn configure_logging(verbose: bool) {
     let env_filter = if verbose {
-        "trace,rustls=info,quinn_proto=debug"
+        "debug,rustls=info,quinn=info,quinn_proto=debug,solana_streamer=debug,solana_lite_rpc_quic_forward_proxy=trace"
     } else {
-        "debug,quinn_proto=info,rustls=info,solana_streamer=debug"
+        "info,rustls=info,quinn=info,quinn_proto=info,solana_streamer=info,solana_lite_rpc_quic_forward_proxy=info"
     };
+    let span_mode = if verbose {
+        FmtSpan::CLOSE
+    } else {
+        FmtSpan::NONE
+    };
+    // EnvFilter::try_from_default_env().unwrap_or(env_filter)
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or(EnvFilter::from_str(env_filter).unwrap());
+
     let result = tracing_subscriber::fmt::fmt()
-        .with_env_filter(env_filter)
+        .with_env_filter(filter)
+        .with_span_events(span_mode)
         .try_init();
     if result.is_err() {
         println!("Logging already initialized - ignore");
