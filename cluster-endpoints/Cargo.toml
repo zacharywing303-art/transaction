@@ -12,6 +12,10 @@ license = "AGPL"
 #geyser-grpc-connector = { tag = "v0.5.0+yellowstone.1.11+solana.1.16.17", git = "https://github.com/blockworks-foundation/geyser-grpc-connector.git" }
 geyser-grpc-connector = "0.7.2+yellowstone.1.11"
 
+solana-lite-rpc-blocks-processing = { workspace = true }
+solana-lite-rpc-transaction-processing = { workspace = true }
+solana-lite-rpc-cluster = { workspace = true }
+
 solana-sdk = { workspace = true }
 solana-rpc-client-api = { workspace = true }
 solana-transaction-status = { workspace = true }
