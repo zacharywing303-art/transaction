@@ -1,8 +1,12 @@
-use geyser_grpc_connector::grpc_subscription_autoreconnect_tasks::create_geyser_autoconnection_task;
-use std::{collections::HashMap, time::Duration};
+use futures::StreamExt;
+use merge_streams::MergeStreams;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 
 use geyser_grpc_connector::GrpcSourceConfig;
-use geyser_grpc_connector::Message::GeyserSubscribeUpdate;
 use itertools::Itertools;
 use solana_lite_rpc_core::{
     commitment_utils::Commitment,
@@ -28,28 +32,18 @@ pub fn start_account_streaming_tasks(
 ) -> AnyhowJoinHandle {
     tokio::spawn(async move {
         'main_loop: loop {
-            // for now we can only be sure that there is one confirmed block per slot, for processed there can be multiple confirmed blocks
-            // So setting commitment to confirmed
-            // To do somehow make it processed, we we could get blockhash with slot it should be ideal
-            let confirmed_commitment = yellowstone_grpc_proto::geyser::CommitmentLevel::Confirmed;
+            let processed_commitment = yellowstone_grpc_proto::geyser::CommitmentLevel::Processed;
 
-            let mut subscribe_accounts: HashMap<String, SubscribeRequestFilterAccounts> =
+            let mut subscribe_programs: HashMap<String, SubscribeRequestFilterAccounts> =
                 HashMap::new();
+
+            let mut accounts_to_subscribe = HashSet::new();
 
             for (index, accounts_filter) in accounts_filters.iter().enumerate() {
                 if !accounts_filter.accounts.is_empty() {
-                    subscribe_accounts.insert(
-                        format!("accounts_{index:?}"),
-                        SubscribeRequestFilterAccounts {
-                            account: accounts_filter
-                                .accounts
-                                .iter()
-                                .map(|x| x.to_string())
-                                .collect_vec(),
-                            owner: vec![],
-                            filters: vec![],
-                        },
-                    );
+                    accounts_filter.accounts.iter().for_each(|account| {
+                        accounts_to_subscribe.insert(account.clone());
+                    });
                 }
                 if let Some(program_id) = &accounts_filter.program_id {
                     let filters = if let Some(filters) = &accounts_filter.filters {
@@ -81,13 +75,18 @@ pub fn start_account_streaming_tasks(
                                         )),
                                     }
                                 }
+                                AccountFilterType::TokenAccountState => {
+                                    SubscribeRequestFilterAccountsFilter {
+                                        filter: Some(Filter::TokenAccountState(false)),
+                                    }
+                                }
                             })
                             .collect_vec()
                     } else {
                         vec![]
                     };
-                    subscribe_accounts.insert(
-                        format!("accounts_{}", program_id),
+                    subscribe_programs.insert(
+                        format!("program_accounts_{}", index),
                         SubscribeRequestFilterAccounts {
                             account: vec![],
                             owner: vec![program_id.clone()],
@@ -97,21 +96,70 @@ pub fn start_account_streaming_tasks(
                 }
             }
 
-            let subscribe_request = SubscribeRequest {
-                accounts: subscribe_accounts,
+            let program_subscription = SubscribeRequest {
+                accounts: subscribe_programs,
                 slots: Default::default(),
                 transactions: Default::default(),
                 blocks: Default::default(),
                 blocks_meta: Default::default(),
                 entry: Default::default(),
-                commitment: Some(confirmed_commitment.into()),
+                commitment: Some(processed_commitment.into()),
                 accounts_data_slice: Default::default(),
                 ping: None,
             };
-            let (_abort_handler, mut accounts_stream) =
-                create_geyser_autoconnection_task(grpc_config.clone(), subscribe_request);
 
-            while let Some(GeyserSubscribeUpdate(message)) = accounts_stream.recv().await {
+            let mut client = yellowstone_grpc_client::GeyserGrpcClient::connect(
+                grpc_config.grpc_addr.clone(),
+                grpc_config.grpc_x_token.clone(),
+                None,
+            )
+            .unwrap();
+            let account_stream = client.subscribe_once2(program_subscription).await.unwrap();
+
+            // each account subscription batch will require individual stream
+            let mut subscriptions = vec![account_stream];
+            let mut index = 0;
+            for accounts_chunk in accounts_to_subscribe.iter().collect_vec().chunks(100) {
+                let mut accounts_subscription: HashMap<String, SubscribeRequestFilterAccounts> =
+                    HashMap::new();
+                index += 1;
+                accounts_subscription.insert(
+                    format!("account_sub_{}", index),
+                    SubscribeRequestFilterAccounts {
+                        account: accounts_chunk
+                            .iter()
+                            .map(|acc| (*acc).clone())
+                            .collect_vec(),
+                        owner: vec![],
+                        filters: vec![],
+                    },
+                );
+                let mut client = yellowstone_grpc_client::GeyserGrpcClient::connect(
+                    grpc_config.grpc_addr.clone(),
+                    grpc_config.grpc_x_token.clone(),
+                    None,
+                )
+                .unwrap();
+
+                let account_request = SubscribeRequest {
+                    accounts: accounts_subscription,
+                    slots: Default::default(),
+                    transactions: Default::default(),
+                    blocks: Default::default(),
+                    blocks_meta: Default::default(),
+                    entry: Default::default(),
+                    commitment: Some(processed_commitment.into()),
+                    accounts_data_slice: Default::default(),
+                    ping: None,
+                };
+
+                let account_stream = client.subscribe_once2(account_request).await.unwrap();
+                subscriptions.push(account_stream);
+            }
+            let mut merged_stream = subscriptions.merge();
+
+            while let Some(message) = merged_stream.next().await {
+                let message = message.unwrap();
                 let Some(update) = message.update_oneof else {
                     continue;
                 };
@@ -130,17 +178,17 @@ pub fn start_account_streaming_tasks(
                             let notification = AccountNotificationMessage {
                                 data: AccountData {
                                     pubkey: Pubkey::new_from_array(account_pk_bytes),
-                                    account: Account {
+                                    account: Arc::new(Account {
                                         lamports: account_data.lamports,
                                         data: account_data.data,
                                         owner: Pubkey::new_from_array(owner),
                                         executable: account_data.executable,
                                         rent_epoch: account_data.rent_epoch,
-                                    },
+                                    }),
                                     updated_slot: account.slot,
                                 },
                                 // TODO update with processed commitment / check above
-                                commitment: Commitment::Confirmed,
+                                commitment: Commitment::Processed,
                             };
                             if account_stream_sx.send(notification).is_err() {
                                 // non recoverable, i.e the whole stream is being restarted
@@ -168,12 +216,12 @@ pub fn create_grpc_account_streaming(
     grpc_sources: Vec<GrpcSourceConfig>,
     accounts_filters: AccountFilters,
 ) -> (AnyhowJoinHandle, AccountStream) {
-    let (account_sender, accounts_stream) = broadcast::channel::<AccountNotificationMessage>(128);
+    let (account_sender, accounts_stream) = broadcast::channel::<AccountNotificationMessage>(1024);
 
     let jh: AnyhowJoinHandle = tokio::spawn(async move {
         loop {
             let (accounts_sx, mut accounts_rx) = tokio::sync::mpsc::unbounded_channel();
-            grpc_sources
+            let jhs = grpc_sources
                 .iter()
                 .map(|grpc_config| {
                     start_account_streaming_tasks(
@@ -199,6 +247,11 @@ pub fn create_grpc_account_streaming(
                         break;
                     }
                 }
+            }
+
+            for jh in jhs {
+                // abort previous handles
+                jh.abort();
             }
         }
     });
